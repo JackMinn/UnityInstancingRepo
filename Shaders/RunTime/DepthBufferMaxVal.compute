@@ -1,0 +1,342 @@
+﻿//I think the goal here should be not just to compute the minimum z, but also to create the shadow region
+//the reason for this is reading back to the CPU from the GPU is going to cause a huge stall and will hurt performance
+//If I can compute it in this kernel, then I can bypass the read back to CPU (which is slower than writing to GPU),
+//then other compute shaders should read from GPU
+//This memory synchronization is going to be tricky, we dont want to read from global memory over and over
+//And we also dont want to stall the entire render process because 1 core is computing the shadow planes in this kernel
+
+/*
+    Depth buffer is 1 for close objects and 0 for far objects and is not stored linearly. 
+    Also the lack of an object (aka rendering the skybox) will result in writing 0 in the depth buffer
+    For that reason we need to handle this corner case, and ignore a depth buffer value of 0.
+    After that we can convert to linear depth between 0 to 1. We wrote the function for DX, unsure about openGL yet.
+*/
+
+#define groupDim_x 128
+#define MAX_UINT 4294967295.0
+
+#pragma kernel ComputeMaxDepth
+#pragma kernel ComputeShadowRegionPlanes
+
+cbuffer DepthBufferIterationConstants
+{
+    float4 _ZBufferParams;
+    float maxShadowRange;
+    uint yAxisDownsample = 1;
+};
+
+Texture2D<float4> _DepthTexture;
+groupshared float sharedMem[groupDim_x];
+RWStructuredBuffer<uint> maxDepth;
+
+float Linear01Depth(float z);
+
+[numthreads(groupDim_x, 1, 1)]
+void ComputeMaxDepth(uint3 group_id : SV_GroupID, uint group_thread_index : SV_GroupIndex)
+{
+    uint tid = group_thread_index;
+    uint i = group_id.x * (groupDim_x * 2) + tid;
+    sharedMem[tid] = min(_DepthTexture[uint2(i, group_id.y * yAxisDownsample)].x, _DepthTexture[uint2(i + groupDim_x, group_id.y * yAxisDownsample)].x);
+    GroupMemoryBarrierWithGroupSync();
+
+    //all if statements with groupDim_x will be optimized by compiler since the result is known, this allows the compiled shader to be flexible
+    if (groupDim_x >= 1024)
+    {
+        if (tid < 512)
+        {
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 512]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (groupDim_x >= 512)
+    {
+        if (tid < 256)
+        {
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 256]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (groupDim_x >= 256)
+    {
+        if (tid < 128)
+        {
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 128]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (groupDim_x >= 128)
+    {
+        if (tid < 64)
+        {
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 64]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid < 32)
+    {
+        if (groupDim_x >= 64)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 32]);
+        if (groupDim_x >= 32)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 16]);
+        if (groupDim_x >= 16)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 8]);
+        if (groupDim_x >= 8)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 4]);
+        if (groupDim_x >= 4)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 2]);
+        if (groupDim_x >= 2)
+            sharedMem[tid] = min(sharedMem[tid], sharedMem[tid + 1]);
+    }
+
+    if (tid == 0)
+    {
+        if (sharedMem[tid] != 0)
+        {
+            float linearDepth = Linear01Depth(1.0 - sharedMem[tid]); //I could alter the ZBufferParams to match how unity 5.6 does it and drop 1 - x
+            linearDepth = min(linearDepth, maxShadowRange); //clamp the max shadow range through the shadow manager
+            uint blockMaxDepth = (uint) (linearDepth * MAX_UINT); //we should linearize depth first to use full dynamic range, or linearize after?
+            InterlockedMax(maxDepth[0], blockMaxDepth); //we need to reset the value of this to 0 at the start of every frame
+        }
+    }
+}
+
+// Z buffer to linear 0..1 depth - this is for DirectX, might also work for openGL
+inline float Linear01Depth(float z)
+{
+    return 1.0 / (_ZBufferParams.x * z + _ZBufferParams.y);
+}
+
+//=============================================================================================================================
+
+cbuffer ShadowRegionComputeConstants
+{
+    float4 frustumPlanes[6];
+    float4 camData; //near clip plane, far clip plane, fov, aspect ratio
+    float4x4 cameraToWorldMatrix;
+    float4 lightDir;
+};
+RWStructuredBuffer<float4> shadowRegionPlanes;
+RWStructuredBuffer<uint> readOnlyMaxDepth;
+groupshared float cachedAdjustedFarPlane;
+groupshared float4 sharedFrustumPlanes[6];
+groupshared float4 sharedFrustumCorners[8];
+groupshared uint planeCounter = 1;
+groupshared uint warpPredicateMask = 0;
+
+const groupshared uint4 frustumPlaneNeighborsTable[6] =
+{
+    uint4(2, 3, 4, 5), //Left FP
+    uint4(2, 3, 4, 5), //Right FP
+    uint4(0, 1, 4, 5), //Top FP
+    uint4(0, 1, 4, 5), //Bottom FP
+    uint4(0, 1, 2, 3), //Near FP
+    uint4(0, 1, 2, 3)  //Far FP 
+};
+
+const groupshared uint2 frustumPlaneIntersectionPointsTable[6][6] =
+{
+    {uint2(0, 0), uint2(0, 0), uint2(5, 1), uint2(0, 4), uint2(4, 5), uint2(1, 0)}, //left frustum plane
+    {uint2(3, 3), uint2(3, 3), uint2(2, 6), uint2(7, 3), uint2(6, 7), uint2(3, 2)}, //right frustum plane
+    {uint2(1, 5), uint2(6, 2), uint2(5, 1), uint2(0, 4), uint2(5, 6), uint2(2, 1)}, //top frustum plane
+    {uint2(4, 0), uint2(3, 7), uint2(4, 0), uint2(0, 4), uint2(7, 4), uint2(0, 3)}, //bottom frustum plane
+    {uint2(5, 4), uint2(7, 6), uint2(6, 5), uint2(4, 7), uint2(5, 6), uint2(2, 1)}, //near frustum plane
+    {uint2(0, 1), uint2(2, 3), uint2(1, 2), uint2(3, 0), uint2(1, 2), uint2(2, 1)}  //far frustum plane
+};
+
+void GetFrustumCorners(uint tid);
+void SetupShadowRegionPlanes(uint tid);
+bool PlaneFromThreePoints(float3 point1, float3 point2, float3 point3, out float4 plane);
+uint ContiguousIndexFromPredicate(bool predicate, uint tid);
+
+[numthreads(8, 1, 1)]
+void ComputeShadowRegionPlanes(uint3 group_id : SV_GroupID, uint group_thread_index : SV_GroupIndex)
+{
+    if (group_thread_index < 6)
+    {
+        sharedFrustumPlanes[group_thread_index] = frustumPlanes[group_thread_index];
+        if (group_thread_index == 5)
+        {
+            cachedAdjustedFarPlane = (((float) readOnlyMaxDepth[0]) / MAX_UINT) * camData.y;
+            //cachedAdjustedFarPlane = min(cachedAdjustedFarPlane, maxShadowRange);  //debating using absolute value because editor has really long range far clip plane
+            readOnlyMaxDepth[0] = 0; //we need to reset this so the next depth compute pass can find the new max, otherwise we must reset from CPU with more overhead
+
+            //now we need the normal and distance in world space to define the frustum plane
+            float3 worldPlaneNormal = mul((float3x3)cameraToWorldMatrix, float3(0, 0, -1)); //camera will always have uniform scaling
+            float3 worldPointOnPlane = mul(cameraToWorldMatrix, float4(0, 0, cachedAdjustedFarPlane, 1)).xyz;
+            float distance = length(worldPointOnPlane); //get distance from origin
+            sharedFrustumPlanes[5] = float4(worldPlaneNormal, distance);
+        }
+    }
+    SetupShadowRegionPlanes(group_thread_index);
+}
+
+inline void GetFrustumCorners(uint tid)
+{
+    float farClipPlane = cachedAdjustedFarPlane;
+    //float farClipPlane = camData.y;                                                  //for debugging purposes
+
+    float frustumFarHeight = farClipPlane * tan(camData.z * 0.5);
+    float frustumFarWidth = frustumFarHeight * camData.w;
+    float frustumNearHeight = camData.x * tan(camData.z * 0.5);
+    float frustumNearWidth = frustumNearHeight * camData.w;
+
+    float4 tempCornerArray[8];
+
+    float4 farBottomLeft = float4(-frustumFarWidth, -frustumFarHeight, farClipPlane, 1);
+    tempCornerArray[0] = farBottomLeft;
+    float4 farTopLeft = float4(-frustumFarWidth, frustumFarHeight, farClipPlane, 1);
+    tempCornerArray[1] = farTopLeft;
+    float4 farTopRight = float4(frustumFarWidth, frustumFarHeight, farClipPlane, 1);
+    tempCornerArray[2] = farTopRight;
+    float4 farBottomRight = float4(frustumFarWidth, -frustumFarHeight, farClipPlane, 1);
+    tempCornerArray[3] = farBottomRight;
+
+    float4 nearBottomLeft = float4(-frustumNearWidth, -frustumNearHeight, camData.x, 1);
+    tempCornerArray[4] = nearBottomLeft;
+    float4 nearTopLeft = float4(-frustumNearWidth, frustumNearHeight, camData.x, 1);
+    tempCornerArray[5] = nearTopLeft;
+    float4 nearTopRight = float4(frustumNearWidth, frustumNearHeight, camData.x, 1);
+    tempCornerArray[6] = nearTopRight;
+    float4 nearBottomRight = float4(frustumNearWidth, -frustumNearHeight, camData.x, 1);
+    tempCornerArray[7] = nearBottomRight;
+
+    sharedFrustumCorners[tid] = mul(cameraToWorldMatrix, tempCornerArray[tid]);
+}
+
+inline uint2 GetCornersOfFrustumPlaneIntersection(uint plane1, uint plane2)
+{
+    return frustumPlaneIntersectionPointsTable[plane1][plane2];
+}
+
+void SetupShadowRegionPlanes(uint tid)
+{
+    GetFrustumCorners(tid);
+
+    if (tid < 6)
+    {
+        bool frustumFacingLight = dot(lightDir.xyz, sharedFrustumPlanes[tid].xyz) < 0;
+        uint index = ContiguousIndexFromPredicate(frustumFacingLight, tid);
+        index += planeCounter;
+        if (tid == 0)
+        {
+            InterlockedAdd(planeCounter, countbits(warpPredicateMask)); //its okay for all threads to write this, its the same value for all, but this is safer
+            warpPredicateMask = 0;
+        }
+
+        if (frustumFacingLight)
+        {
+            shadowRegionPlanes[index] = sharedFrustumPlanes[tid];
+        }
+    }
+
+    if (tid < 6)
+    {
+        if (dot(lightDir.xyz, sharedFrustumPlanes[tid].xyz) < 0)
+        {
+            uint4 frustumPlaneNeighbors = frustumPlaneNeighborsTable[tid];
+            
+            [unroll]
+            for (uint i = 0; i < 4; i++)
+            {
+                bool frustumParallelLight = dot(lightDir.xyz, sharedFrustumPlanes[frustumPlaneNeighbors[i]].xyz) > 0;
+
+                if (frustumParallelLight)
+                {
+                    uint2 commonEdgeCorners = GetCornersOfFrustumPlaneIntersection(tid, frustumPlaneNeighbors[i]);
+
+                    float3 point1 = sharedFrustumCorners[commonEdgeCorners.x].xyz;
+                    float3 point2 = sharedFrustumCorners[commonEdgeCorners.y].xyz;
+                    float3 point3 = point1 + lightDir.xyz;
+
+                    float4 plane;
+                    bool nonZero = PlaneFromThreePoints(point1, point2, point3, plane); //optimize to not add 0 planes
+
+                    uint index = ContiguousIndexFromPredicate(nonZero, tid);
+                    index += planeCounter;
+
+                    if (nonZero)
+                        shadowRegionPlanes[index] = plane;
+
+                    //sometimes thread 0 doesnt enter this branch, so the thread running this code must be chosen dynamically
+                    if (tid == firstbitlow(warpPredicateMask))
+                    {
+                        InterlockedAdd(planeCounter, countbits(warpPredicateMask));
+                        warpPredicateMask = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    //can pack more into this 
+    if (tid == 0) 
+        shadowRegionPlanes[0] = float4(planeCounter - 1, 0, 0, 0);
+}
+
+//helper functions
+
+inline bool GetSafeNormal(float3 vec, float tolerance, out float3 result)
+{
+    float squareSum = dot(vec, vec);
+
+    if (squareSum == 1.f)
+    {
+        result = vec;
+        return true;
+    }
+    else if (squareSum < tolerance)
+    {
+        result = 0;
+        return false;
+    }
+
+    float scale = 1 / sqrt(squareSum);
+    result = vec * scale;
+    return true;
+}
+
+//Unity uses ax + by + cd + d = 0, so we flip distance sign
+inline bool PlaneFromThreePoints(float3 point1, float3 point2, float3 point3, out float4 plane)
+{
+    float3 vector1 = point2 - point1;
+    float3 vector2 = point3 - point1;
+    float3 crossResult = cross(vector1, vector2);
+    float3 planeNormal;
+    bool nonZero = GetSafeNormal(crossResult, 0.01, planeNormal);
+    float distance = dot(point1, planeNormal);
+    plane = float4(planeNormal, -distance);
+    return nonZero;
+}
+
+inline uint ContiguousIndexFromPredicate(bool predicate, uint tid)
+{
+    uint threadPredicateMask = predicate << tid;            //tid 5 will cause a mask of 00100000
+    InterlockedOr(warpPredicateMask, threadPredicateMask);
+    uint threadIdMask = (2 << tid) - 1;                     //tid = 5 will have a mask of 00111111
+    uint index = threadIdMask & warpPredicateMask;
+    index = countbits(index) - 1;                           //number of bits gives [1,32] index, go back to 0 based index for the array 
+
+    return index;
+}
+
+
+
+
+
+//Frustum Planes in Order
+    //FP_LEFT,
+    //FP_RIGHT,
+    //FP_TOP,
+    //FP_BOTTOM,
+    //FP_NEAR,
+    //FP_FAR,
+
+//Frustum Corners in Order
+    //FAR_BOTTOM_LEFT,
+    //FAR_TOP_LEFT,
+    //FAR_TOP_RIGHT,
+    //FAR_BOTTOM_RIGHT,
+    //NEAR_BOTTOM_LEFT,
+    //NEAR_TOP_LEFT,
+    //NEAR_TOP_RIGHT,
+    //NEAR_BOTTOM_RIGHT,
