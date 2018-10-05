@@ -13,6 +13,10 @@ vast and dense scenes without succumbing to the CPU bottleneck associated with i
 
 ![My image](Instancing8.png)
 
+
+# Youtube Video of the Demo Scene
+[![Alt text](https://img.youtube.com/vi/-wnC70_Lyiw/0.jpg)](https://www.youtube.com/watch?v=-wnC70_Lyiw)
+
 The tool has several advanced features including:
 - Screen space LODing with up to 4 LODs. Supports a coarse far cull distance to provide an early out before computing screen space size for more thorough culling.
 - Proper shadow caster culling. Large objects which are frustum culled but whose shadows are still visible within the camera frustum are correctly rendered during a shadowcaster pass.
