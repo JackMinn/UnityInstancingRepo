@@ -1,5 +1,3 @@
-﻿//different LODs mean that the instanceIDs are incorrect, several 0s for example, also ztesting is fucked up
-//the instanceIDs are relative to the append buffers, so LODing and frustum culling plays a role here
 
 Shader "JacksInstancing/ColorPickerShader" {
 	Properties{
