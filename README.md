@@ -17,5 +17,7 @@ The tool has several advanced features including:
 
 ![Editor Picking](Instancing3.png)
 
+The above image is an example of how the picking works. Any instanced object in the entire scene can be selected, and the control data to do so is printed out to "DebugRT". You can see however that the tree trunks cannot be selected, this is because the tessellation altered the depth value of those fragments, and when those same fragments are rendered in the picking pass without tessellation, they fail the depth test against the current depth buffer. 
+
 Limitations:
 - As of current, scene picking does not work properly with instances using shaders implementing either tessellation or alpha cutout. The reason for this is, as of current, the shader that renders control data for scene picking does not have any notion of alpha cutout or tesselation, but is rather a naive shader. A fix to this in the long term would be to write a custom shader preprocessor that reads the source shader file, and builds a picking pass that pulls the vertex shader from the original shader and incorporates it. Similarly, the fragment shader would be scanned for the clip alpha test, as well as all instructions that the clip test depends on (reading an alpha channel from a texture for example), and incorporate those into the fragment shader for the picking pass. On the other hand, convex objects like a rock that are not tessellated behave as expected and can be picked properly. 
