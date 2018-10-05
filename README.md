@@ -6,3 +6,11 @@ vast and dense scenes without succumbing to the CPU bottleneck associated with i
 ![My image](Instancing1.png)
 
 ![My image](Instancing2.png)
+
+The tool has several advanced features including:
+- Screen space LODing with up to 4 LODs. Supports a coarse far cull distance to provide an early out before computing screen space size for more thorough culling.
+- Proper shadow caster culling. Large objects which are frustum culled but whose shadows are still visible within the camera frustum are correctly rendered during a shadowcaster pass.
+- Support for motion vectors pass. The Redwood scene has foliage with vertex shaders providing wind animation, the motion vectors for these animations are required in order to properly support Temporal Anti-Aliasing and Motion Blur.
+- Support for tessellation. A common issue is that Unity does not support instancing for shaders implementing tessellation. This is overcome by taking the hlsl code created by Unity's surface shaders, and preventing barycentric interpolation on the SV_InstanceID attribute when it is passed down the pipeline.
+- Support for procedural generation of transforms based on constraints. Can sample the splat map of the terrain and decide which textures to spawn what assets on (foliage on grass, twigs on dirt etc). Offers 2 different spawning algorithms, Uniform spawning and Stratified spawning.
+- Support for editor picking. Gizmos that control positioning/rotating/scaling assets are the same as Unity's and thus the entire toolset is transparent to the user when working with the editor. It is possible to simulataneously multi-select Unity GameObjects and Instances, and then apply transform changes to both at the same time. There is also undo support via Crtl+Z which operates in the exact same way as Unitys. It is in fact possible to modify the transforms for a group of Unity GameObjects and Instances at the same time, and then undo those changes with a single Ctrl+Z. As such, all editor integration is completely transparent. 
