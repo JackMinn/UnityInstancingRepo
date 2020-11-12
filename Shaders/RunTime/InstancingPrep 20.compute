@@ -254,17 +254,16 @@ void InverseMatrix(float4x4 objectToWorld, out float4x4 worldToObject)
     worldToObject._14_24_34_44 = float4(w2oPosition, 1.0f);
 }
 
-//Assumes uniform scale with scale in w component
 bool InsideFrustum(float4 data, float4x4 objectToWorld, float4x4 worldToObject)
 {
     for (int i = 0; i < 6; i++)
     {
         float4 objectSpaceFrustumPlane = frustumPlanes[i].xyzw;
-        float3 pointOnPlane = -objectSpaceFrustumPlane.xyz * objectSpaceFrustumPlane.w;
+        float3 pointOnPlane = -objectSpaceFrustumPlane.xyz * objectSpaceFrustumPlane.w; // plane normal * d gives point on plane
 
-        objectSpaceFrustumPlane.xyz = mul(objectSpaceFrustumPlane.xyz, (float3x3) objectToWorld);
+        objectSpaceFrustumPlane.xyz = mul(objectSpaceFrustumPlane.xyz, (float3x3) objectToWorld);  // convert plane normal to object space with inverse transpose
 
-        pointOnPlane = mul(worldToObject, float4(pointOnPlane, 1)).xyz;
+        pointOnPlane = mul(worldToObject, float4(pointOnPlane, 1)).xyz;  // convert pointOnPlane from world space to object space
 
         //there are 8 possible combinations, one for each vertex of the bounding box, this picks the vertex the closest to the center of the frustum
         //NOTE: its not the actual closest point to the plane, its the closest to the center of the frustum in the direction of the plane normal
